@@ -96,8 +96,8 @@ function handleExport() {
               : 'text-gray-400 hover:text-gray-200'"
           >
             工况切片
-            <span v-if="store.dutyCycleSegments.length > 0" class="ml-1 text-xs bg-cyan-600 text-white rounded-full px-1.5 py-0.5">
-              {{ store.dutyCycleSegments.length }}
+            <span v-if="store.allSegmentsWithCurrent.length > 0" class="ml-1 text-xs bg-cyan-600 text-white rounded-full px-1.5 py-0.5">
+              {{ store.allSegmentsWithCurrent.length }}
             </span>
           </button>
         </div>

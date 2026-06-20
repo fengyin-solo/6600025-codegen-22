@@ -39,13 +39,23 @@ export interface BusStats {
 
 export type DutyCycleType = 'idle' | 'acceleration' | 'braking' | 'cruise' | 'deceleration';
 
+export interface DutyCycleSignalStats {
+  min: number;
+  max: number;
+  avg: number;
+  std: number;
+  count: number;
+  unit: string;
+  values: { time: number; value: number }[];
+}
+
 export interface DutyCycleSegment {
   id: string;
   type: DutyCycleType;
   startTime: number;
   endTime: number;
   frameCount: number;
-  signals: Record<string, { min: number; max: number; avg: number; values: { time: number; value: number }[]>;
+  signals: Record<string, DutyCycleSignalStats>;
 }
 
 export interface DutyCycleStats {

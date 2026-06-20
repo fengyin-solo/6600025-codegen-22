@@ -3,7 +3,7 @@ import { computed, ref, watch } from 'vue';
 import VChart from 'vue-echarts';
 import { use } from 'echarts/core';
 import { CanvasRenderer } from 'echarts/renderers';
-import { LineChart, BarChart } from 'echarts/charts';
+import { LineChart, BarChart, CustomChart } from 'echarts/charts';
 import {
   GridComponent,
   TooltipComponent,
@@ -13,14 +13,14 @@ import {
 import { useCanBusStore } from '../store/canbus';
 import type { DutyCycleType } from '../types';
 
-use([CanvasRenderer, LineChart, BarChart, GridComponent, TooltipComponent, LegendComponent, DataZoomComponent]);
+use([CanvasRenderer, LineChart, BarChart, CustomChart, GridComponent, TooltipComponent, LegendComponent, DataZoomComponent]);
 
 const store = useCanBusStore();
 const selectedSignal = ref<string>('VehicleSpeed');
 
 const availableSignals = computed(() => {
   const sigs = new Set<string>();
-  for (const seg of store.dutyCycleSegments) {
+  for (const seg of store.allSegmentsWithCurrent) {
     for (const name of Object.keys(seg.signals)) {
       sigs.add(name);
     }
@@ -176,22 +176,23 @@ const segmentChartOption = computed(() => {
 });
 
 const signalComparisonOption = computed(() => {
+  const allSegments = store.allSegmentsWithCurrent;
   const segments = store.selectedDutyCycleType
-    ? store.dutyCycleSegments.filter(s => s.type === store.selectedDutyCycleType)
-    : store.dutyCycleSegments;
+    ? allSegments.filter(s => s.type === store.selectedDutyCycleType)
+    : allSegments;
 
   if (segments.length === 0) {
     return { backgroundColor: '#111827' };
   }
 
-  const colors = ['#06b6d4', '#22c55e', '#ef4444', '#eab308', '#a855f7', '#f97316'];
-  const series = segments.slice(-10).map((seg, idx) => {
+  const series = segments.slice(-10).map((seg) => {
     const meta = store.getDutyCycleMeta(seg.type);
     const sigData = seg.signals[selectedSignal.value];
-    if (!sigData) return null;
-    const startTime = sigData.values[0]?.time || 0;
+    if (!sigData || sigData.values.length === 0) return null;
+    const startTime = sigData.values[0].time;
+    const idx = allSegments.indexOf(seg);
     return {
-      name: `${meta.label} #${store.dutyCycleSegments.indexOf(seg) + 1}`,
+      name: `${meta.label} #${idx + 1}`,
       type: 'line' as const,
       smooth: true,
       symbol: 'none',
@@ -200,7 +201,7 @@ const signalComparisonOption = computed(() => {
       data: sigData.values.map(d => [(d.time - startTime) / 1000, d.value]),
       opacity: store.selectedSegmentId && seg.id !== store.selectedSegmentId ? 0.3 : 1
     };
-  }).filter(Boolean);
+  }).filter(Boolean) as any[];
 
   return {
     backgroundColor: '#111827',
@@ -312,7 +313,7 @@ const statsChartOption = computed(() => {
     <div class="px-4 py-2 bg-gray-800 border-b border-gray-700 flex items-center justify-between">
       <h3 class="text-sm font-semibold text-gray-300">工况切片分析</h3>
       <span class="text-xs text-gray-500">
-        {{ store.dutyCycleSegments.length }} 个切片
+        {{ store.allSegmentsWithCurrent.length }} 个切片
       </span>
     </div>
 
@@ -431,8 +432,11 @@ const statsChartOption = computed(() => {
             :key="String(name)"
             class="bg-gray-900 rounded p-2"
           >
-            <div class="text-xs text-gray-400 mb-1">{{ String(name) }}</div>
-            <div class="grid grid-cols-3 gap-1 text-xs">
+            <div class="text-xs text-gray-400 mb-1">
+              {{ String(name) }}
+              <span v-if="sig.unit" class="text-gray-600">({{ sig.unit }})</span>
+            </div>
+            <div class="grid grid-cols-4 gap-1 text-xs">
               <div>
                 <span class="text-gray-500">最小</span>
                 <div class="text-gray-200 font-mono">{{ sig.min.toFixed(1) }}</div>
@@ -445,12 +449,17 @@ const statsChartOption = computed(() => {
                 <span class="text-gray-500">最大</span>
                 <div class="text-gray-200 font-mono">{{ sig.max.toFixed(1) }}</div>
               </div>
+              <div>
+                <span class="text-gray-500">波动</span>
+                <div class="text-yellow-400 font-mono">{{ sig.std.toFixed(2) }}</div>
+              </div>
             </div>
+            <div class="mt-1 text-[10px] text-gray-600">采样 {{ sig.count }} 点</div>
           </div>
         </div>
       </div>
 
-      <div v-if="store.dutyCycleSegments.length === 0" class="flex items-center justify-center py-12">
+      <div v-if="store.allSegmentsWithCurrent.length === 0" class="flex items-center justify-center py-12">
         <p class="text-gray-600 text-sm">暂无工况数据 — 点击"开始捕获"以生成</p>
       </div>
     </div>
