@@ -1,9 +1,12 @@
 <script setup lang="ts">
+import { ref } from 'vue';
 import { useCanBusStore } from './store/canbus';
 import FrameTable from './components/FrameTable.vue';
 import SignalChart from './components/SignalChart.vue';
+import DutyCycleAnalysis from './components/DutyCycleAnalysis.vue';
 
 const store = useCanBusStore();
+const rightPanelTab = ref<'signals' | 'duty'>('signals');
 
 function handleLoadDbc() {
   store.loadMockDbc();
@@ -73,9 +76,35 @@ function handleExport() {
         <FrameTable />
       </div>
 
-      <!-- Right Panel: Signal Chart (40%) -->
+      <!-- Right Panel: Signal Chart / Duty Cycle Analysis (40%) -->
       <div class="w-2/5 flex flex-col overflow-hidden">
-        <SignalChart />
+        <div class="flex border-b border-gray-700 bg-gray-800 shrink-0">
+          <button
+            @click="rightPanelTab = 'signals'"
+            class="px-4 py-2 text-sm font-medium transition-colors"
+            :class="rightPanelTab === 'signals'
+              ? 'text-cyan-400 border-b-2 border-cyan-400 bg-gray-900/50'
+              : 'text-gray-400 hover:text-gray-200'"
+          >
+            信号趋势
+          </button>
+          <button
+            @click="rightPanelTab = 'duty'"
+            class="px-4 py-2 text-sm font-medium transition-colors"
+            :class="rightPanelTab === 'duty'
+              ? 'text-cyan-400 border-b-2 border-cyan-400 bg-gray-900/50'
+              : 'text-gray-400 hover:text-gray-200'"
+          >
+            工况切片
+            <span v-if="store.dutyCycleSegments.length > 0" class="ml-1 text-xs bg-cyan-600 text-white rounded-full px-1.5 py-0.5">
+              {{ store.dutyCycleSegments.length }}
+            </span>
+          </button>
+        </div>
+        <div class="flex-1 overflow-hidden">
+          <SignalChart v-if="rightPanelTab === 'signals'" />
+          <DutyCycleAnalysis v-else />
+        </div>
       </div>
     </main>
 

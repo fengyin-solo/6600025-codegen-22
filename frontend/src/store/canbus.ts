@@ -1,9 +1,29 @@
 import { defineStore } from 'pinia';
 import { ref, computed } from 'vue';
-import type { CanFrame, DbcMessage, BusStats } from '../types';
+import type { CanFrame, DbcMessage, BusStats, DutyCycleType, DutyCycleSegment, DutyCycleStats } from '../types';
 import { parseDbc, decodeCanFrame, DEFAULT_DBC_CONTENT } from '../utils/dbc-parser';
 
 let frameIdCounter = 0;
+let segmentIdCounter = 0;
+
+const DUTY_CYCLE_THRESHOLDS = {
+  idleSpeedMax: 5,
+  idleRpmMax: 1200,
+  accelerationSpeedDelta: 2,
+  accelerationThrottleMin: 30,
+  brakingSpeedDelta: -2,
+  cruiseSpeedDeltaMax: 1,
+  cruiseSpeedMin: 20,
+  decelerationSpeedDelta: -1
+};
+
+const DUTY_CYCLE_META: Record<DutyCycleType, { label: string; color: string }> = {
+  idle: { label: '怠速', color: '#6b7280' },
+  acceleration: { label: '加速', color: '#22c55e' },
+  braking: { label: '制动', color: '#ef4444' },
+  cruise: { label: '匀速', color: '#06b6d4' },
+  deceleration: { label: '减速', color: '#eab308' }
+};
 
 export const useCanBusStore = defineStore('canbus', () => {
   const frames = ref<CanFrame[]>([]);
@@ -13,6 +33,8 @@ export const useCanBusStore = defineStore('canbus', () => {
   const filterText = ref('');
   const isCapturing = ref(false);
   const pollInterval = ref<number | null>(null);
+  const selectedSegmentId = ref<string | null>(null);
+  const selectedDutyCycleType = ref<DutyCycleType | null>(null);
 
   const busStats = ref<BusStats>({
     totalFrames: 0,
@@ -22,6 +44,11 @@ export const useCanBusStore = defineStore('canbus', () => {
     busLoad: 0,
     lastUpdate: Date.now()
   });
+
+  const dutyCycleSegments = ref<DutyCycleSegment[]>([]);
+  let currentSegment: DutyCycleSegment | null = null;
+  let lastSpeed: number | null = null;
+  let lastSpeedTime: number | null = null;
 
   const filteredFrames = computed(() => {
     let result = frames.value;
@@ -52,6 +79,157 @@ export const useCanBusStore = defineStore('canbus', () => {
     return busStats.value.busLoad.toFixed(1);
   });
 
+  const filteredDutyCycleSegments = computed(() => {
+    if (!selectedDutyCycleType.value) return dutyCycleSegments.value;
+    return dutyCycleSegments.value.filter(s => s.type === selectedDutyCycleType.value);
+  });
+
+  const dutyCycleStats = computed<DutyCycleStats[]>(() => {
+    const statsMap = new Map<DutyCycleType, { count: number; totalDuration: number }>();
+    for (const type of Object.keys(DUTY_CYCLE_META) as DutyCycleType[]) {
+      statsMap.set(type, { count: 0, totalDuration: 0 });
+    }
+    for (const seg of dutyCycleSegments.value) {
+      const s = statsMap.get(seg.type)!;
+      s.count++;
+      s.totalDuration += (seg.endTime - seg.startTime);
+    }
+    return (Object.keys(DUTY_CYCLE_META) as DutyCycleType[]).map(type => {
+      const meta = DUTY_CYCLE_META[type];
+      const s = statsMap.get(type)!;
+      return {
+        type,
+        label: meta.label,
+        color: meta.color,
+        count: s.count,
+        totalDuration: s.totalDuration,
+        avgDuration: s.count > 0 ? s.totalDuration / s.count : 0
+      };
+    });
+  });
+
+  const selectedSegment = computed(() => {
+    if (!selectedSegmentId.value) return null;
+    return dutyCycleSegments.value.find(s => s.id === selectedSegmentId.value) || null;
+  });
+
+  function detectDutyCycle(speed: number | undefined, rpm: number | undefined, throttle: number | undefined, timestamp: number): DutyCycleType {
+    if (speed !== undefined && rpm !== undefined) {
+      if (speed <= DUTY_CYCLE_THRESHOLDS.idleSpeedMax && rpm <= DUTY_CYCLE_THRESHOLDS.idleRpmMax) {
+        return 'idle';
+      }
+      if (lastSpeed !== null && lastSpeedTime !== null) {
+        const dt = Math.max(1, timestamp - lastSpeedTime);
+        const speedDeltaPerSec = ((speed - lastSpeed) / dt) * 1000;
+        if (speedDeltaPerSec <= DUTY_CYCLE_THRESHOLDS.brakingSpeedDelta) {
+          return 'braking';
+        }
+        if (speedDeltaPerSec >= DUTY_CYCLE_THRESHOLDS.accelerationSpeedDelta &&
+            throttle !== undefined && throttle >= DUTY_CYCLE_THRESHOLDS.accelerationThrottleMin) {
+          return 'acceleration';
+        }
+        if (speed >= DUTY_CYCLE_THRESHOLDS.cruiseSpeedMin &&
+            Math.abs(speedDeltaPerSec) <= DUTY_CYCLE_THRESHOLDS.cruiseSpeedDeltaMax) {
+          return 'cruise';
+        }
+        if (speedDeltaPerSec <= DUTY_CYCLE_THRESHOLDS.decelerationSpeedDelta) {
+          return 'deceleration';
+        }
+      }
+    }
+    return speed !== undefined && speed <= DUTY_CYCLE_THRESHOLDS.idleSpeedMax ? 'idle' : 'cruise';
+  }
+
+  function finalizeCurrentSegment() {
+    if (currentSegment) {
+      for (const sigName of Object.keys(currentSegment.signals)) {
+        const sig = currentSegment.signals[sigName];
+        if (sig.values.length > 0) {
+          const vals = sig.values.map(v => v.value);
+          sig.min = Math.min(...vals);
+          sig.max = Math.max(...vals);
+          sig.avg = vals.reduce((a, b) => a + b, 0) / vals.length;
+        }
+      }
+      dutyCycleSegments.value.push(currentSegment);
+      currentSegment = null;
+    }
+  }
+
+  function createNewSegment(type: DutyCycleType, timestamp: number): DutyCycleSegment {
+    return {
+      id: `seg-${++segmentIdCounter}`,
+      type,
+      startTime: timestamp,
+      endTime: timestamp,
+      frameCount: 0,
+      signals: {}
+    };
+  }
+
+  function updateDutyCycleAnalysis(frame: CanFrame) {
+    const speed = frame.decoded.VehicleSpeed;
+    const rpm = frame.decoded.EngineRPM;
+    const throttle = frame.decoded.ThrottlePosition;
+
+    if (speed === undefined || rpm === undefined) {
+      lastSpeed = null;
+      lastSpeedTime = null;
+      return;
+    }
+
+    const detectedType = detectDutyCycle(speed, rpm, throttle, frame.timestamp);
+
+    if (!currentSegment || currentSegment.type !== detectedType) {
+      finalizeCurrentSegment();
+      currentSegment = createNewSegment(detectedType, frame.timestamp);
+    }
+
+    currentSegment.endTime = frame.timestamp;
+    currentSegment.frameCount++;
+
+    for (const [name, value] of Object.entries(frame.decoded)) {
+      if (!currentSegment.signals[name]) {
+        currentSegment.signals[name] = { min: value, max: value, avg: value, values: [] };
+      }
+      const sig = currentSegment.signals[name];
+      sig.values.push({ time: frame.timestamp, value });
+      if (sig.values.length > 500) {
+        sig.values = sig.values.slice(-500);
+      }
+    }
+
+    if (dutyCycleSegments.value.length > 200) {
+      dutyCycleSegments.value = dutyCycleSegments.value.slice(-200);
+    }
+
+    lastSpeed = speed;
+    lastSpeedTime = frame.timestamp;
+  }
+
+  function selectSegment(id: string | null) {
+    selectedSegmentId.value = id;
+  }
+
+  function filterByDutyCycleType(type: DutyCycleType | null) {
+    selectedDutyCycleType.value = type;
+    selectedSegmentId.value = null;
+  }
+
+  function clearDutyCycleAnalysis() {
+    dutyCycleSegments.value = [];
+    currentSegment = null;
+    lastSpeed = null;
+    lastSpeedTime = null;
+    selectedSegmentId.value = null;
+    selectedDutyCycleType.value = null;
+    segmentIdCounter = 0;
+  }
+
+  function getDutyCycleMeta(type: DutyCycleType) {
+    return DUTY_CYCLE_META[type];
+  }
+
   function addFrame(frame: CanFrame) {
     frames.value.push(frame);
     if (frames.value.length > 500) {
@@ -62,6 +240,8 @@ export const useCanBusStore = defineStore('canbus', () => {
     if (frame.direction === 'RX') busStats.value.rxCount++;
     else busStats.value.txCount++;
     busStats.value.lastUpdate = Date.now();
+
+    updateDutyCycleAnalysis(frame);
 
     // Update signal history
     const msgDef = dbcMessages.value.get(frame.arbitrationId);
@@ -96,6 +276,8 @@ export const useCanBusStore = defineStore('canbus', () => {
       lastUpdate: Date.now()
     };
     frameIdCounter = 0;
+    clearDutyCycleAnalysis();
+    resetMockState();
   }
 
   function loadMockDbc() {
@@ -106,7 +288,118 @@ export const useCanBusStore = defineStore('canbus', () => {
     dbcMessages.value = parseDbc(text);
   }
 
+  const mockDrivingState = ref({
+    phase: 'idle' as 'idle' | 'accelerate' | 'cruise' | 'decelerate' | 'brake',
+    phaseStartTime: Date.now(),
+    currentSpeed: 0,
+    currentRpm: 800,
+    currentThrottle: 0,
+    currentLoad: 10,
+    coolantTemp: 75,
+    frameCount: 0
+  });
+
+  const PHASE_DURATIONS = {
+    idle: { min: 30, max: 60 },
+    accelerate: { min: 20, max: 40 },
+    cruise: { min: 40, max: 80 },
+    decelerate: { min: 15, max: 30 },
+    brake: { min: 10, max: 20 }
+  };
+
+  function resetMockState() {
+    mockDrivingState.value = {
+      phase: 'idle',
+      phaseStartTime: Date.now(),
+      currentSpeed: 0,
+      currentRpm: 800,
+      currentThrottle: 0,
+      currentLoad: 10,
+      coolantTemp: 75,
+      frameCount: 0
+    };
+  }
+
+  function shouldTransitionPhase(): boolean {
+    const durations = PHASE_DURATIONS[mockDrivingState.value.phase];
+    const elapsedFrames = mockDrivingState.value.frameCount;
+    const minFrames = durations.min;
+    const maxFrames = durations.max;
+    if (elapsedFrames < minFrames) return false;
+    if (elapsedFrames >= maxFrames) return true;
+    return Math.random() < 0.15;
+  }
+
+  function getNextPhase(): 'idle' | 'accelerate' | 'cruise' | 'decelerate' | 'brake' {
+    const s = mockDrivingState.value;
+    switch (s.phase) {
+      case 'idle':
+        return 'accelerate';
+      case 'accelerate':
+        return Math.random() < 0.7 ? 'cruise' : 'decelerate';
+      case 'cruise':
+        return Math.random() < 0.5 ? 'decelerate' : 'accelerate';
+      case 'decelerate':
+        if (s.currentSpeed <= 5) return 'idle';
+        return Math.random() < 0.6 ? 'brake' : 'cruise';
+      case 'brake':
+        return s.currentSpeed <= 3 ? 'idle' : 'decelerate';
+      default:
+        return 'idle';
+    }
+  }
+
   function generateMockFrame(): CanFrame {
+    const s = mockDrivingState.value;
+    s.frameCount++;
+
+    if (shouldTransitionPhase()) {
+      s.phase = getNextPhase();
+      s.phaseStartTime = Date.now();
+      s.frameCount = 0;
+    }
+
+    switch (s.phase) {
+      case 'idle':
+        s.currentSpeed = Math.max(0, s.currentSpeed + (Math.random() - 0.6) * 0.3);
+        s.currentRpm = 800 + Math.random() * 150;
+        s.currentThrottle = Math.random() * 5;
+        s.currentLoad = 8 + Math.random() * 8;
+        break;
+      case 'accelerate':
+        s.currentSpeed = Math.min(120, s.currentSpeed + 1.5 + Math.random() * 1.5);
+        s.currentRpm = Math.min(6000, s.currentRpm + 80 + Math.random() * 60);
+        s.currentThrottle = 50 + Math.random() * 45;
+        s.currentLoad = 60 + Math.random() * 35;
+        break;
+      case 'cruise':
+        s.currentSpeed = s.currentSpeed + (Math.random() - 0.5) * 0.8;
+        s.currentRpm = Math.max(1500, Math.min(3000, s.currentSpeed * 30 + (Math.random() - 0.5) * 200));
+        s.currentThrottle = 20 + Math.random() * 20;
+        s.currentLoad = 30 + Math.random() * 25;
+        break;
+      case 'decelerate':
+        s.currentSpeed = Math.max(0, s.currentSpeed - 1 - Math.random() * 0.8);
+        s.currentRpm = Math.max(800, s.currentRpm - 50 - Math.random() * 40);
+        s.currentThrottle = Math.random() * 10;
+        s.currentLoad = 15 + Math.random() * 15;
+        break;
+      case 'brake':
+        s.currentSpeed = Math.max(0, s.currentSpeed - 3 - Math.random() * 2);
+        s.currentRpm = Math.max(800, s.currentRpm - 150 - Math.random() * 100);
+        s.currentThrottle = 0;
+        s.currentLoad = 5 + Math.random() * 10;
+        break;
+    }
+
+    s.coolantTemp = Math.min(110, s.coolantTemp + (Math.random() - 0.4) * 0.2);
+
+    const rpm = Math.round(s.currentRpm);
+    const speed = Math.round(s.currentSpeed);
+    const temp = Math.round(s.coolantTemp);
+    const throttle = Math.round(s.currentThrottle);
+    const load = Math.round(s.currentLoad);
+
     const messageIds = Array.from(dbcMessages.value.keys());
     const arbId = messageIds.length > 0
       ? messageIds[Math.floor(Math.random() * messageIds.length)]
@@ -114,14 +407,6 @@ export const useCanBusStore = defineStore('canbus', () => {
 
     const msgDef = dbcMessages.value.get(arbId);
 
-    // Generate realistic OBD-II values
-    const rpm = Math.floor(800 + Math.random() * 5200);
-    const speed = Math.floor(Math.random() * 120);
-    const temp = Math.floor(70 + Math.random() * 35);
-    const throttle = Math.floor(Math.random() * 100);
-    const load = Math.floor(Math.random() * 100);
-
-    // Encode values into bytes (simplified encoding for display)
     const rpmRaw = Math.round(rpm / 0.25);
     const rpmLow = rpmRaw & 0xFF;
     const rpmHigh = (rpmRaw >> 8) & 0xFF;
@@ -177,6 +462,7 @@ export const useCanBusStore = defineStore('canbus', () => {
       clearInterval(pollInterval.value);
       pollInterval.value = null;
     }
+    finalizeCurrentSegment();
   }
 
   function decodeFrame(frame: CanFrame): Record<string, number> {
@@ -206,6 +492,12 @@ export const useCanBusStore = defineStore('canbus', () => {
     isCapturing,
     filteredFrames,
     busLoadPercent,
+    dutyCycleSegments,
+    filteredDutyCycleSegments,
+    dutyCycleStats,
+    selectedSegment,
+    selectedSegmentId,
+    selectedDutyCycleType,
     addFrame,
     clearFrames,
     loadMockDbc,
@@ -213,6 +505,9 @@ export const useCanBusStore = defineStore('canbus', () => {
     startCapture,
     stopCapture,
     decodeFrame,
-    exportFrames
+    exportFrames,
+    selectSegment,
+    filterByDutyCycleType,
+    getDutyCycleMeta
   };
 });
